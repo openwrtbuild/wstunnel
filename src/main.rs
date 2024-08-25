@@ -1,51 +1,38 @@
-mod dns;
 mod embedded_certificate;
+mod protocols;
 mod restrictions;
-mod socks5;
-mod socks5_udp;
-mod stdio;
-mod tcp;
-mod tls;
-mod tls_utils;
 mod tunnel;
-mod udp;
-#[cfg(unix)]
-mod unix_socket;
 
-use anyhow::anyhow;
+use crate::protocols::dns::DnsResolver;
+use crate::protocols::tls;
+use crate::restrictions::types::RestrictionsRules;
+use crate::tunnel::client::{TlsClientConfig, WsClient, WsClientConfig};
+use crate::tunnel::connectors::{Socks5TunnelConnector, TcpTunnelConnector, UdpTunnelConnector};
+use crate::tunnel::listeners::{
+    new_stdio_listener, HttpProxyTunnelListener, Socks5TunnelListener, TcpTunnelListener, UdpTunnelListener,
+};
+use crate::tunnel::server::{TlsServerConfig, WsServer, WsServerConfig};
+use crate::tunnel::transport::{TransportAddr, TransportScheme};
+use crate::tunnel::{to_host_port, LocalProtocol, RemoteAddr};
+use anyhow::{anyhow, Context};
 use base64::Engine;
 use clap::Parser;
-use futures_util::{stream, TryStreamExt};
 use hyper::header::HOST;
 use hyper::http::{HeaderName, HeaderValue};
 use log::debug;
-use once_cell::sync::Lazy;
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::{Debug, Formatter};
+use std::collections::BTreeMap;
+use std::fmt::Debug;
+use std::io;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{fmt, io};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::select;
-
-use tokio_rustls::rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, ServerName};
-use tokio_rustls::TlsConnector;
-
+use tokio_rustls::rustls::pki_types::DnsName;
 use tracing::{error, info};
-
-use crate::dns::DnsResolver;
-use crate::restrictions::types::RestrictionsRules;
-use crate::tls_utils::{cn_from_certificate, find_leaf_certificate};
-use crate::tunnel::tls_reloader::TlsReloader;
-use crate::tunnel::{to_host_port, RemoteAddr, TransportAddr, TransportScheme};
-use crate::udp::MyUdpSocket;
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::EnvFilter;
 use url::{Host, Url};
@@ -108,6 +95,9 @@ struct Client {
     /// 'socks5://[::1]:1212'            =>       listen locally with socks5 on port 1212 and forward dynamically requested tunnel
     /// 'socks5://[::1]:1212?login=admin&password=admin' => listen locally with socks5 on port 1212 and only accept connection with login=admin and password=admin
     ///
+    /// 'http://[::1]:1212'              =>       start a http proxy on port 1212 and forward dynamically requested tunnel
+    /// 'http://[::1]:1212?login=admin&password=admin' => start a http proxy on port 1212 and only accept connection with login=admin and password=admin
+    ///
     /// 'tproxy+tcp://[::1]:1212'        =>       listen locally on tcp on port 1212 as a *transparent proxy* and forward dynamically requested tunnel
     /// 'tproxy+udp://[::1]:1212?timeout_sec=10'  listen locally on udp on port 1212 as a *transparent proxy* and forward dynamically requested tunnel
     ///                                           linux only and requires sudo/CAP_NET_ADMIN
@@ -123,8 +113,9 @@ struct Client {
     /// 'tcp://1212:google.com:443'      =>     listen on server for incoming tcp cnx on port 1212 and forward to google.com on port 443 from local machine
     /// 'udp://1212:1.1.1.1:53'          =>     listen on server for incoming udp on port 1212 and forward to cloudflare dns 1.1.1.1 on port 53 from local machine
     /// 'socks5://[::1]:1212'            =>     listen on server for incoming socks5 request on port 1212 and forward dynamically request from local machine (login/password is supported)
+    /// 'http://[::1]:1212'         =>     listen on server for incoming http proxy request on port 1212 and forward dynamically request from local machine (login/password is supported)
     /// 'unix://wstunnel.sock:g.com:443' =>     listen on server for incoming data from unix socket of path wstunnel.sock and forward to g.com:443 from local machine
-    #[arg(short='R', long, value_name = "{tcp,udp,socks5,unix}://[BIND:]PORT:HOST:PORT", value_parser = parse_tunnel_arg, verbatim_doc_comment)]
+    #[arg(short='R', long, value_name = "{tcp,udp,socks5,unix}://[BIND:]PORT:HOST:PORT", value_parser = parse_reverse_tunnel_arg, verbatim_doc_comment)]
     remote_to_local: Vec<LocalToRemote>,
 
     /// (linux only) Mark network packet with SO_MARK sockoption with the specified value.
@@ -200,7 +191,8 @@ struct Client {
     #[arg(long, value_name = "USER[:PASS]", value_parser = parse_http_credentials, verbatim_doc_comment)]
     http_upgrade_credentials: Option<HeaderValue>,
 
-    /// Frequency at which the client will send websocket ping to the server.
+    /// Frequency at which the client will send websocket pings to the server.
+    /// Set to zero to disable.
     #[arg(long, value_name = "seconds", default_value = "30", value_parser = parse_duration_sec, verbatim_doc_comment)]
     websocket_ping_frequency_sec: Option<Duration>,
 
@@ -230,7 +222,7 @@ struct Client {
     ///     Obviously, this is not going to work for tunneling traffic
     ///   - if you have wstunnel behind a reverse proxy, most of them (i.e: nginx) are going to turn http2 request into http1
     ///     This is not going to work, because http1 does not support streaming naturally
-    /// The only way to make it works with http2 is to have wstunnel directly exposed to the internet without any reverse proxy in front of it
+    ///   - The only way to make it works with http2 is to have wstunnel directly exposed to the internet without any reverse proxy in front of it
     #[arg(value_name = "ws[s]|http[s]://wstunnel.server.com[:port]", value_parser = parse_server_url, verbatim_doc_comment)]
     remote_addr: Url,
 
@@ -286,7 +278,8 @@ struct Server {
     socket_so_mark: Option<u32>,
 
     /// Frequency at which the server will send websocket ping to client.
-    #[arg(long, value_name = "seconds", value_parser = parse_duration_sec, verbatim_doc_comment)]
+    /// Set to zero to disable.
+    #[arg(long, value_name = "seconds", default_value = "30", value_parser = parse_duration_sec, verbatim_doc_comment)]
     websocket_ping_frequency_sec: Option<Duration>,
 
     /// Enable the masking of websocket frames. Default is false
@@ -361,52 +354,36 @@ struct Server {
     /// The ca will be automatically reloaded if it changes
     #[arg(long, value_name = "FILE_PATH", verbatim_doc_comment)]
     tls_client_ca_certs: Option<PathBuf>,
-}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum LocalProtocol {
-    Tcp {
-        proxy_protocol: bool,
-    },
-    Udp {
-        timeout: Option<Duration>,
-    },
-    Stdio,
-    Socks5 {
-        timeout: Option<Duration>,
-        credentials: Option<(String, String)>,
-    },
-    TProxyTcp,
-    TProxyUdp {
-        timeout: Option<Duration>,
-    },
-    ReverseTcp,
-    ReverseUdp {
-        timeout: Option<Duration>,
-    },
-    ReverseSocks5 {
-        timeout: Option<Duration>,
-        credentials: Option<(String, String)>,
-    },
-    ReverseUnix {
-        path: PathBuf,
-    },
-    Unix {
-        path: PathBuf,
-    },
-}
+    /// If set, will use this http proxy to connect to the client
+    #[arg(
+        short = 'p',
+        long,
+        value_name = "USER:PASS@HOST:PORT",
+        verbatim_doc_comment,
+        env = "HTTP_PROXY"
+    )]
+    http_proxy: Option<String>,
 
-impl LocalProtocol {
-    pub const fn is_reverse_tunnel(&self) -> bool {
-        matches!(self, Self::ReverseTcp | Self::ReverseUdp { .. } | Self::ReverseSocks5 { .. })
-    }
+    /// If set, will use this login to connect to the http proxy. Override the one from --http-proxy
+    #[arg(long, value_name = "LOGIN", verbatim_doc_comment, env = "WSTUNNEL_HTTP_PROXY_LOGIN")]
+    http_proxy_login: Option<String>,
+
+    /// If set, will use this password to connect to the http proxy. Override the one from --http-proxy
+    #[arg(
+        long,
+        value_name = "PASSWORD",
+        verbatim_doc_comment,
+        env = "WSTUNNEL_HTTP_PROXY_PASSWORD"
+    )]
+    http_proxy_password: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct LocalToRemote {
     local_protocol: LocalProtocol,
     local: SocketAddr,
-    remote: (Host<String>, u16),
+    remote: (Host, u16),
 }
 
 fn parse_duration_sec(arg: &str) -> Result<Duration, io::Error> {
@@ -494,107 +471,166 @@ fn parse_tunnel_dest(remaining: &str) -> Result<(Host<String>, u16, BTreeMap<Str
 
 fn parse_tunnel_arg(arg: &str) -> Result<LocalToRemote, io::Error> {
     use std::io::Error;
+    let get_timeout = |options: &BTreeMap<String, String>| {
+        options
+            .get("timeout_sec")
+            .and_then(|x| x.parse::<u64>().ok())
+            .map(|d| if d == 0 { None } else { Some(Duration::from_secs(d)) })
+            .unwrap_or(Some(Duration::from_secs(30)))
+    };
+    let get_credentials = |options: &BTreeMap<String, String>| {
+        options
+            .get("login")
+            .and_then(|login| options.get("password").map(|p| (login.to_string(), p.to_string())))
+    };
+    let get_proxy_protocol = |options: &BTreeMap<String, String>| options.contains_key("proxy_protocol");
 
-    match &arg[..6] {
-        "tcp://" => {
-            let (local_bind, remaining) = parse_local_bind(&arg[6..])?;
+    let Some((proto, tunnel_info)) = arg.split_once("://") else {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("cannot parse protocol from {}", arg),
+        ));
+    };
+
+    match proto {
+        "tcp" => {
+            let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
             let (dest_host, dest_port, options) = parse_tunnel_dest(remaining)?;
-            let proxy_protocol = options.contains_key("proxy_protocol");
             Ok(LocalToRemote {
-                local_protocol: LocalProtocol::Tcp { proxy_protocol },
+                local_protocol: LocalProtocol::Tcp {
+                    proxy_protocol: get_proxy_protocol(&options),
+                },
                 local: local_bind,
                 remote: (dest_host, dest_port),
             })
         }
-        "udp://" => {
-            let (local_bind, remaining) = parse_local_bind(&arg[6..])?;
+        "udp" => {
+            let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
             let (dest_host, dest_port, options) = parse_tunnel_dest(remaining)?;
-            let timeout = options
-                .get("timeout_sec")
-                .and_then(|x| x.parse::<u64>().ok())
-                .map(|d| if d == 0 { None } else { Some(Duration::from_secs(d)) })
-                .unwrap_or(Some(Duration::from_secs(30)));
 
             Ok(LocalToRemote {
-                local_protocol: LocalProtocol::Udp { timeout },
+                local_protocol: LocalProtocol::Udp {
+                    timeout: get_timeout(&options),
+                },
                 local: local_bind,
                 remote: (dest_host, dest_port),
             })
         }
-        "unix:/" => {
-            let Some((path, remote)) = arg[7..].split_once(':') else {
+        "unix" => {
+            let Some((path, remote)) = tunnel_info.split_once(':') else {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     format!("cannot parse unix socket path from {}", arg),
                 ));
             };
-            let (dest_host, dest_port, _options) = parse_tunnel_dest(remote)?;
+            let (dest_host, dest_port, options) = parse_tunnel_dest(remote)?;
             Ok(LocalToRemote {
                 local_protocol: LocalProtocol::Unix {
                     path: PathBuf::from(path),
+                    proxy_protocol: get_proxy_protocol(&options),
                 },
                 local: SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0)),
                 remote: (dest_host, dest_port),
             })
         }
-        _ => match &arg[..8] {
-            "socks5:/" => {
-                let (local_bind, remaining) = parse_local_bind(&arg[9..])?;
-                let x = format!("0.0.0.0:0?{}", remaining);
-                let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
-                let timeout = options
-                    .get("timeout_sec")
-                    .and_then(|x| x.parse::<u64>().ok())
-                    .map(|d| if d == 0 { None } else { Some(Duration::from_secs(d)) })
-                    .unwrap_or(Some(Duration::from_secs(30)));
-                let credentials = options
-                    .get("login")
-                    .and_then(|login| options.get("password").map(|p| (login.to_string(), p.to_string())));
-                Ok(LocalToRemote {
-                    local_protocol: LocalProtocol::Socks5 { timeout, credentials },
-                    local: local_bind,
-                    remote: (dest_host, dest_port),
-                })
-            }
-            "stdio://" => {
-                let (dest_host, dest_port, _options) = parse_tunnel_dest(&arg[8..])?;
-                Ok(LocalToRemote {
-                    local_protocol: LocalProtocol::Stdio,
-                    local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(0), 0)),
-                    remote: (dest_host, dest_port),
-                })
-            }
-            "tproxy+t" => {
-                let (local_bind, remaining) = parse_local_bind(&arg["tproxy+tcp://".len()..])?;
-                let x = format!("0.0.0.0:0?{}", remaining);
-                let (dest_host, dest_port, _options) = parse_tunnel_dest(&x)?;
-                Ok(LocalToRemote {
-                    local_protocol: LocalProtocol::TProxyTcp,
-                    local: local_bind,
-                    remote: (dest_host, dest_port),
-                })
-            }
-            "tproxy+u" => {
-                let (local_bind, remaining) = parse_local_bind(&arg["tproxy+udp://".len()..])?;
-                let x = format!("0.0.0.0:0?{}", remaining);
-                let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
-                let timeout = options
-                    .get("timeout_sec")
-                    .and_then(|x| x.parse::<u64>().ok())
-                    .map(|d| if d == 0 { None } else { Some(Duration::from_secs(d)) })
-                    .unwrap_or(Some(Duration::from_secs(30)));
-                Ok(LocalToRemote {
-                    local_protocol: LocalProtocol::TProxyUdp { timeout },
-                    local: local_bind,
-                    remote: (dest_host, dest_port),
-                })
-            }
-            _ => Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("Invalid local protocol for tunnel {}", arg),
-            )),
-        },
+        "http" => {
+            let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
+            let x = format!("0.0.0.0:0?{}", remaining);
+            let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
+            Ok(LocalToRemote {
+                local_protocol: LocalProtocol::HttpProxy {
+                    timeout: get_timeout(&options),
+                    credentials: get_credentials(&options),
+                    proxy_protocol: get_proxy_protocol(&options),
+                },
+                local: local_bind,
+                remote: (dest_host, dest_port),
+            })
+        }
+        "socks5" => {
+            let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
+            let x = format!("0.0.0.0:0?{}", remaining);
+            let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
+            Ok(LocalToRemote {
+                local_protocol: LocalProtocol::Socks5 {
+                    timeout: get_timeout(&options),
+                    credentials: get_credentials(&options),
+                },
+                local: local_bind,
+                remote: (dest_host, dest_port),
+            })
+        }
+        "stdio" => {
+            let (dest_host, dest_port, options) = parse_tunnel_dest(tunnel_info)?;
+            Ok(LocalToRemote {
+                local_protocol: LocalProtocol::Stdio {
+                    proxy_protocol: get_proxy_protocol(&options),
+                },
+                local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(0), 0)),
+                remote: (dest_host, dest_port),
+            })
+        }
+        "tproxy+tcp" => {
+            let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
+            let x = format!("0.0.0.0:0?{}", remaining);
+            let (dest_host, dest_port, _options) = parse_tunnel_dest(&x)?;
+            Ok(LocalToRemote {
+                local_protocol: LocalProtocol::TProxyTcp,
+                local: local_bind,
+                remote: (dest_host, dest_port),
+            })
+        }
+        "tproxy+udp" => {
+            let (local_bind, remaining) = parse_local_bind(tunnel_info)?;
+            let x = format!("0.0.0.0:0?{}", remaining);
+            let (dest_host, dest_port, options) = parse_tunnel_dest(&x)?;
+            Ok(LocalToRemote {
+                local_protocol: LocalProtocol::TProxyUdp {
+                    timeout: get_timeout(&options),
+                },
+                local: local_bind,
+                remote: (dest_host, dest_port),
+            })
+        }
+        _ => Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("Invalid local protocol for tunnel {}", arg),
+        )),
     }
+}
+
+fn parse_reverse_tunnel_arg(arg: &str) -> Result<LocalToRemote, io::Error> {
+    let proto = parse_tunnel_arg(arg)?;
+    let local_protocol = match proto.local_protocol {
+        LocalProtocol::Tcp { .. } => LocalProtocol::ReverseTcp {},
+        LocalProtocol::Udp { timeout } => LocalProtocol::ReverseUdp { timeout },
+        LocalProtocol::Socks5 { timeout, credentials } => LocalProtocol::ReverseSocks5 { timeout, credentials },
+        LocalProtocol::HttpProxy {
+            timeout,
+            credentials,
+            proxy_protocol: _proxy_protocol,
+        } => LocalProtocol::ReverseHttpProxy { timeout, credentials },
+        LocalProtocol::Unix { path, .. } => LocalProtocol::ReverseUnix { path },
+        LocalProtocol::ReverseTcp { .. }
+        | LocalProtocol::ReverseUdp { .. }
+        | LocalProtocol::ReverseSocks5 { .. }
+        | LocalProtocol::ReverseHttpProxy { .. }
+        | LocalProtocol::ReverseUnix { .. }
+        | LocalProtocol::TProxyTcp
+        | LocalProtocol::TProxyUdp { .. }
+        | LocalProtocol::Stdio { .. } => {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("Cannot use {:?} as reverse tunnels {}", proto.local_protocol, arg),
+            ))
+        }
+    };
+
+    Ok(LocalToRemote {
+        local_protocol,
+        local: proto.local,
+        remote: proto.remote,
+    })
 }
 
 fn parse_sni_override(arg: &str) -> Result<DnsName<'static>, io::Error> {
@@ -662,120 +698,8 @@ fn parse_server_url(arg: &str) -> Result<Url, io::Error> {
     Ok(url)
 }
 
-#[derive(Clone)]
-pub struct TlsClientConfig {
-    pub tls_sni_disabled: bool,
-    pub tls_sni_override: Option<DnsName<'static>>,
-    pub tls_verify_certificate: bool,
-    tls_connector: Arc<RwLock<TlsConnector>>,
-    pub tls_certificate_path: Option<PathBuf>,
-    pub tls_key_path: Option<PathBuf>,
-}
-
-impl TlsClientConfig {
-    pub fn tls_connector(&self) -> TlsConnector {
-        self.tls_connector.read().clone()
-    }
-}
-
-#[derive(Debug)]
-pub struct TlsServerConfig {
-    pub tls_certificate: Mutex<Vec<CertificateDer<'static>>>,
-    pub tls_key: Mutex<PrivateKeyDer<'static>>,
-    pub tls_client_ca_certificates: Option<Mutex<Vec<CertificateDer<'static>>>>,
-    pub tls_certificate_path: Option<PathBuf>,
-    pub tls_key_path: Option<PathBuf>,
-    pub tls_client_ca_certs_path: Option<PathBuf>,
-}
-
-pub struct WsServerConfig {
-    pub socket_so_mark: Option<u32>,
-    pub bind: SocketAddr,
-    pub websocket_ping_frequency: Option<Duration>,
-    pub timeout_connect: Duration,
-    pub websocket_mask_frame: bool,
-    pub tls: Option<TlsServerConfig>,
-    pub dns_resolver: DnsResolver,
-    pub restriction_config: Option<PathBuf>,
-}
-
-impl Debug for WsServerConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WsServerConfig")
-            .field("socket_so_mark", &self.socket_so_mark)
-            .field("bind", &self.bind)
-            .field("websocket_ping_frequency", &self.websocket_ping_frequency)
-            .field("timeout_connect", &self.timeout_connect)
-            .field("websocket_mask_frame", &self.websocket_mask_frame)
-            .field("restriction_config", &self.restriction_config)
-            .field("tls", &self.tls.is_some())
-            .field(
-                "mTLS",
-                &self
-                    .tls
-                    .as_ref()
-                    .map(|x| x.tls_client_ca_certificates.is_some())
-                    .unwrap_or(false),
-            )
-            .finish()
-    }
-}
-
-#[derive(Clone)]
-pub struct WsClientConfig {
-    pub remote_addr: TransportAddr,
-    pub socket_so_mark: Option<u32>,
-    pub http_upgrade_path_prefix: String,
-    pub http_upgrade_credentials: Option<HeaderValue>,
-    pub http_headers: HashMap<HeaderName, HeaderValue>,
-    pub http_headers_file: Option<PathBuf>,
-    pub http_header_host: HeaderValue,
-    pub timeout_connect: Duration,
-    pub websocket_ping_frequency: Duration,
-    pub websocket_mask_frame: bool,
-    pub http_proxy: Option<Url>,
-    cnx_pool: Option<bb8::Pool<WsClientConfig>>,
-    tls_reloader: Option<Arc<TlsReloader>>,
-    pub dns_resolver: DnsResolver,
-}
-
-impl WsClientConfig {
-    pub const fn websocket_scheme(&self) -> &'static str {
-        match self.remote_addr.tls().is_some() {
-            false => "ws",
-            true => "wss",
-        }
-    }
-
-    pub fn cnx_pool(&self) -> &bb8::Pool<Self> {
-        self.cnx_pool.as_ref().unwrap()
-    }
-
-    pub fn websocket_host_url(&self) -> String {
-        format!("{}:{}", self.remote_addr.host(), self.remote_addr.port())
-    }
-
-    pub fn tls_server_name(&self) -> ServerName<'static> {
-        static INVALID_DNS_NAME: Lazy<DnsName> = Lazy::new(|| DnsName::try_from("dns-name-invalid.com").unwrap());
-
-        self.remote_addr
-            .tls()
-            .and_then(|tls| tls.tls_sni_override.as_ref())
-            .map_or_else(
-                || match &self.remote_addr.host() {
-                    Host::Domain(domain) => ServerName::DnsName(
-                        DnsName::try_from(domain.clone()).unwrap_or_else(|_| INVALID_DNS_NAME.clone()),
-                    ),
-                    Host::Ipv4(ip) => ServerName::IpAddress(IpAddr::V4(*ip).into()),
-                    Host::Ipv6(ip) => ServerName::IpAddress(IpAddr::V6(*ip).into()),
-                },
-                |sni_override| ServerName::DnsName(sni_override.clone()),
-            )
-    }
-}
-
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let args = Wstunnel::parse();
 
     // Setup logging
@@ -792,7 +716,7 @@ async fn main() {
         if args
             .local_to_remote
             .iter()
-            .filter(|x| x.local_protocol == LocalProtocol::Stdio)
+            .filter(|x| matches!(x.local_protocol, LocalProtocol::Stdio { .. }))
             .count()
             > 0
         {
@@ -822,8 +746,8 @@ async fn main() {
                 // to be the common name (CN) of the client's certificate.
                 tls_certificate
                     .as_ref()
-                    .and_then(|certs| find_leaf_certificate(certs.as_slice()))
-                    .and_then(|leaf_cert| cn_from_certificate(&leaf_cert))
+                    .and_then(|certs| tls::find_leaf_certificate(certs.as_slice()))
+                    .and_then(|leaf_cert| tls::cn_from_certificate(&leaf_cert))
                     .unwrap_or(args.http_upgrade_path_prefix)
             } else {
                 args.http_upgrade_path_prefix
@@ -833,24 +757,7 @@ async fn main() {
                 TransportScheme::from_str(args.remote_addr.scheme()).expect("invalid scheme in server url");
             let tls = match transport_scheme {
                 TransportScheme::Ws | TransportScheme::Http => None,
-                TransportScheme::Wss => Some(TlsClientConfig {
-                    tls_connector: Arc::new(RwLock::new(
-                        tls::tls_connector(
-                            args.tls_verify_certificate,
-                            transport_scheme.alpn_protocols(),
-                            !args.tls_sni_disable,
-                            tls_certificate,
-                            tls_key,
-                        )
-                        .expect("Cannot create tls connector"),
-                    )),
-                    tls_sni_override: args.tls_sni_override,
-                    tls_verify_certificate: args.tls_verify_certificate,
-                    tls_sni_disabled: args.tls_sni_disable,
-                    tls_certificate_path: args.tls_certificate.clone(),
-                    tls_key_path: args.tls_private_key.clone(),
-                }),
-                TransportScheme::Https => Some(TlsClientConfig {
+                TransportScheme::Wss | TransportScheme::Https => Some(TlsClientConfig {
                     tls_connector: Arc::new(RwLock::new(
                         tls::tls_connector(
                             args.tls_verify_certificate,
@@ -884,26 +791,9 @@ async fn main() {
                     panic!("http headers file does not exists: {}", path.display());
                 }
             }
-            let http_proxy = if let Some(proxy) = args.http_proxy {
-                let mut proxy = if proxy.starts_with("http://") {
-                    Url::parse(&proxy).expect("Invalid http proxy url")
-                } else {
-                    Url::parse(&format!("http://{}", proxy)).expect("Invalid http proxy url")
-                };
 
-                if let Some(login) = args.http_proxy_login {
-                    proxy.set_username(login.as_str()).expect("Cannot set http proxy login");
-                }
-                if let Some(password) = args.http_proxy_password {
-                    proxy
-                        .set_password(Some(password.as_str()))
-                        .expect("Cannot set http proxy password");
-                }
-                Some(proxy)
-            } else {
-                None
-            };
-            let mut client_config = WsClientConfig {
+            let http_proxy = mk_http_proxy(args.http_proxy, args.http_proxy_login, args.http_proxy_password)?;
+            let client_config = WsClientConfig {
                 remote_addr: TransportAddr::new(
                     TransportScheme::from_str(args.remote_addr.scheme()).unwrap(),
                     args.remote_addr.host().unwrap().to_owned(),
@@ -918,10 +808,11 @@ async fn main() {
                 http_headers_file: args.http_headers_file,
                 http_header_host: host_header,
                 timeout_connect: Duration::from_secs(10),
-                websocket_ping_frequency: args.websocket_ping_frequency_sec.unwrap_or(Duration::from_secs(30)),
+                websocket_ping_frequency: args
+                    .websocket_ping_frequency_sec
+                    .or(Some(Duration::from_secs(30)))
+                    .filter(|d| d.as_secs() > 0),
                 websocket_mask_frame: args.websocket_mask_frame,
-                cnx_pool: None,
-                tls_reloader: None,
                 dns_resolver: DnsResolver::new_from_urls(
                     &args.dns_resolver,
                     http_proxy.clone(),
@@ -932,244 +823,167 @@ async fn main() {
                 http_proxy,
             };
 
-            let tls_reloader =
-                TlsReloader::new_for_client(Arc::new(client_config.clone())).expect("Cannot create tls reloader");
-            client_config.tls_reloader = Some(Arc::new(tls_reloader));
-            let pool = bb8::Pool::builder()
-                .max_size(1000)
-                .min_idle(Some(args.connection_min_idle))
-                .max_lifetime(Some(Duration::from_secs(30)))
-                .connection_timeout(args.connection_retry_max_backoff_sec)
-                .retry_connection(true)
-                .build(client_config.clone())
-                .await
-                .unwrap();
-            client_config.cnx_pool = Some(pool);
-            let client_config = Arc::new(client_config);
+            let client =
+                WsClient::new(client_config, args.connection_min_idle, args.connection_retry_max_backoff_sec).await?;
 
             // Start tunnels
             for tunnel in args.remote_to_local.into_iter() {
-                let client_config = client_config.clone();
+                let client = client.clone();
                 match &tunnel.local_protocol {
-                    LocalProtocol::Tcp { proxy_protocol: _ } => {
+                    LocalProtocol::ReverseTcp { .. } => {
                         tokio::spawn(async move {
-                            let remote = tunnel.remote.clone();
-                            let cfg = client_config.clone();
-                            let connect_to_dest = |_| async {
-                                tcp::connect(
-                                    &remote.0,
-                                    remote.1,
-                                    cfg.socket_so_mark,
-                                    cfg.timeout_connect,
-                                    &cfg.dns_resolver,
-                                )
-                                .await
-                            };
-
+                            let cfg = client.config.clone();
+                            let tcp_connector = TcpTunnelConnector::new(
+                                &tunnel.remote.0,
+                                tunnel.remote.1,
+                                cfg.socket_so_mark,
+                                cfg.timeout_connect,
+                                &cfg.dns_resolver,
+                            );
                             let (host, port) = to_host_port(tunnel.local);
                             let remote = RemoteAddr {
                                 protocol: LocalProtocol::ReverseTcp,
                                 host,
                                 port,
                             };
-                            if let Err(err) =
-                                tunnel::client::run_reverse_tunnel(client_config, remote, connect_to_dest).await
-                            {
+                            if let Err(err) = client.run_reverse_tunnel(remote, tcp_connector).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
-                    LocalProtocol::Udp { timeout } => {
+                    LocalProtocol::ReverseUdp { timeout } => {
                         let timeout = *timeout;
 
                         tokio::spawn(async move {
-                            let cfg = client_config.clone();
+                            let cfg = client.config.clone();
                             let (host, port) = to_host_port(tunnel.local);
                             let remote = RemoteAddr {
                                 protocol: LocalProtocol::ReverseUdp { timeout },
                                 host,
                                 port,
                             };
-                            let connect_to_dest = |_| async {
-                                udp::connect(
-                                    &tunnel.remote.0,
-                                    tunnel.remote.1,
-                                    cfg.timeout_connect,
-                                    cfg.socket_so_mark,
-                                    &cfg.dns_resolver,
-                                )
-                                .await
-                            };
+                            let udp_connector = UdpTunnelConnector::new(
+                                &remote.host,
+                                remote.port,
+                                cfg.socket_so_mark,
+                                cfg.timeout_connect,
+                                &cfg.dns_resolver,
+                            );
 
-                            if let Err(err) =
-                                tunnel::client::run_reverse_tunnel(client_config, remote, connect_to_dest).await
-                            {
+                            if let Err(err) = client.run_reverse_tunnel(remote.clone(), udp_connector).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
-                    LocalProtocol::Socks5 { timeout, credentials } => {
-                        trait T: AsyncWrite + AsyncRead + Unpin + Send {}
-                        impl T for TcpStream {}
-                        impl T for MyUdpSocket {}
-
+                    LocalProtocol::ReverseSocks5 { timeout, credentials } => {
                         let credentials = credentials.clone();
                         let timeout = *timeout;
                         tokio::spawn(async move {
-                            let cfg = client_config.clone();
+                            let cfg = client.config.clone();
                             let (host, port) = to_host_port(tunnel.local);
                             let remote = RemoteAddr {
                                 protocol: LocalProtocol::ReverseSocks5 { timeout, credentials },
                                 host,
                                 port,
                             };
-                            let connect_to_dest = |remote: Option<RemoteAddr>| {
-                                let so_mark = cfg.socket_so_mark;
-                                let timeout = cfg.timeout_connect;
-                                let dns_resolver = &cfg.dns_resolver;
-                                async move {
-                                    let Some(remote) = remote else {
-                                        return Err(anyhow!("Missing remote destination for reverse socks5"));
-                                    };
+                            let socks_connector =
+                                Socks5TunnelConnector::new(cfg.socket_so_mark, cfg.timeout_connect, &cfg.dns_resolver);
 
-                                    match remote.protocol {
-                                        LocalProtocol::Tcp { proxy_protocol: _ } => {
-                                            tcp::connect(&remote.host, remote.port, so_mark, timeout, dns_resolver)
-                                                .await
-                                                .map(|s| Box::new(s) as Box<dyn T>)
-                                        }
-                                        LocalProtocol::Udp { .. } => {
-                                            udp::connect(&remote.host, remote.port, timeout, so_mark, dns_resolver)
-                                                .await
-                                                .map(|s| Box::new(s) as Box<dyn T>)
-                                        }
-                                        _ => Err(anyhow!("Invalid protocol for reverse socks5 {:?}", remote.protocol)),
-                                    }
-                                }
-                            };
-
-                            if let Err(err) =
-                                tunnel::client::run_reverse_tunnel(client_config, remote, connect_to_dest).await
-                            {
+                            if let Err(err) = client.run_reverse_tunnel(remote, socks_connector).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
-                    #[cfg(unix)]
-                    LocalProtocol::Unix { path } => {
-                        let path = path.clone();
+                    LocalProtocol::ReverseHttpProxy { timeout, credentials } => {
+                        let credentials = credentials.clone();
+                        let timeout = *timeout;
                         tokio::spawn(async move {
-                            let remote = tunnel.remote.clone();
-                            let cfg = client_config.clone();
-                            let connect_to_dest = |_| async {
-                                tcp::connect(
-                                    &remote.0,
-                                    remote.1,
-                                    cfg.socket_so_mark,
-                                    cfg.timeout_connect,
-                                    &cfg.dns_resolver,
-                                )
-                                .await
-                            };
-
+                            let cfg = client.config.clone();
                             let (host, port) = to_host_port(tunnel.local);
                             let remote = RemoteAddr {
-                                protocol: LocalProtocol::ReverseUnix { path: path.clone() },
+                                protocol: LocalProtocol::ReverseHttpProxy { timeout, credentials },
                                 host,
                                 port,
                             };
-                            if let Err(err) =
-                                tunnel::client::run_reverse_tunnel(client_config, remote, connect_to_dest).await
-                            {
+                            let tcp_connector = TcpTunnelConnector::new(
+                                &remote.host,
+                                remote.port,
+                                cfg.socket_so_mark,
+                                cfg.timeout_connect,
+                                &cfg.dns_resolver,
+                            );
+
+                            if let Err(err) = client.run_reverse_tunnel(remote.clone(), tcp_connector).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
-                    #[cfg(not(unix))]
-                    LocalProtocol::Unix { .. } => {
-                        panic!("Unix socket is not available for non Unix platform")
+                    LocalProtocol::ReverseUnix { path } => {
+                        let path = path.clone();
+                        tokio::spawn(async move {
+                            let cfg = client.config.clone();
+                            let tcp_connector = TcpTunnelConnector::new(
+                                &tunnel.remote.0,
+                                tunnel.remote.1,
+                                cfg.socket_so_mark,
+                                cfg.timeout_connect,
+                                &cfg.dns_resolver,
+                            );
+
+                            let (host, port) = to_host_port(tunnel.local);
+                            let remote = RemoteAddr {
+                                protocol: LocalProtocol::ReverseUnix { path },
+                                host,
+                                port,
+                            };
+                            if let Err(err) = client.run_reverse_tunnel(remote, tcp_connector).await {
+                                error!("{:?}", err);
+                            }
+                        });
                     }
-                    LocalProtocol::Stdio
+                    LocalProtocol::Stdio { .. }
                     | LocalProtocol::TProxyTcp
                     | LocalProtocol::TProxyUdp { .. }
-                    | LocalProtocol::ReverseTcp
-                    | LocalProtocol::ReverseUdp { .. }
-                    | LocalProtocol::ReverseSocks5 { .. }
-                    | LocalProtocol::ReverseUnix { .. } => {
+                    | LocalProtocol::Tcp { .. }
+                    | LocalProtocol::Udp { .. }
+                    | LocalProtocol::Socks5 { .. }
+                    | LocalProtocol::HttpProxy { .. } => {}
+                    LocalProtocol::Unix { .. } => {
                         panic!("Invalid protocol for reverse tunnel");
                     }
                 }
             }
 
             for tunnel in args.local_to_remote.into_iter() {
-                let client_config = client_config.clone();
+                let client = client.clone();
 
                 match &tunnel.local_protocol {
                     LocalProtocol::Tcp { proxy_protocol } => {
-                        let proxy_protocol = *proxy_protocol;
-                        let remote = tunnel.remote.clone();
-                        let server = tcp::run_server(tunnel.local, false)
-                            .await
-                            .unwrap_or_else(|err| panic!("Cannot start TCP server on {}: {}", tunnel.local, err))
-                            .map_err(anyhow::Error::new)
-                            .map_ok(move |stream| {
-                                let remote = RemoteAddr {
-                                    protocol: LocalProtocol::Tcp { proxy_protocol },
-                                    host: remote.0.clone(),
-                                    port: remote.1,
-                                };
-                                (stream.into_split(), remote)
-                            });
-
+                        let server =
+                            TcpTunnelListener::new(tunnel.local, tunnel.remote.clone(), *proxy_protocol).await?;
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(client_config, server).await {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
                     #[cfg(target_os = "linux")]
                     LocalProtocol::TProxyTcp => {
-                        let server = tcp::run_server(tunnel.local, true)
-                            .await
-                            .unwrap_or_else(|err| panic!("Cannot start TProxy TCP server on {}: {}", tunnel.local, err))
-                            .map_err(anyhow::Error::new)
-                            .map_ok(move |stream| {
-                                // In TProxy mode local destination is the final ip:port destination
-                                let (host, port) = to_host_port(stream.local_addr().unwrap());
-                                let remote = RemoteAddr {
-                                    protocol: LocalProtocol::Tcp { proxy_protocol: false },
-                                    host,
-                                    port,
-                                };
-                                (stream.into_split(), remote)
-                            });
+                        use crate::tunnel::listeners::TproxyTcpTunnelListener;
+                        let server = TproxyTcpTunnelListener::new(tunnel.local, false).await?;
 
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(client_config, server).await {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
                     #[cfg(unix)]
-                    LocalProtocol::Unix { path } => {
-                        let remote = tunnel.remote.clone();
-                        let server = unix_socket::run_server(path)
-                            .await
-                            .unwrap_or_else(|err| {
-                                panic!("Cannot start Unix domain server on {}: {}", tunnel.local, err)
-                            })
-                            .map_err(anyhow::Error::new)
-                            .map_ok(move |stream| {
-                                let remote = RemoteAddr {
-                                    protocol: LocalProtocol::Tcp { proxy_protocol: false },
-                                    host: remote.0.clone(),
-                                    port: remote.1,
-                                };
-                                (stream.into_split(), remote)
-                            });
-
+                    LocalProtocol::Unix { path, proxy_protocol } => {
+                        use crate::tunnel::listeners::UnixTunnelListener;
+                        let server = UnixTunnelListener::new(path, tunnel.remote.clone(), *proxy_protocol).await?;
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(client_config, server).await {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
@@ -1181,27 +995,10 @@ async fn main() {
 
                     #[cfg(target_os = "linux")]
                     LocalProtocol::TProxyUdp { timeout } => {
-                        let timeout = *timeout;
-                        let server =
-                            udp::run_server(tunnel.local, timeout, udp::configure_tproxy, udp::mk_send_socket_tproxy)
-                                .await
-                                .unwrap_or_else(|err| {
-                                    panic!("Cannot start TProxy UDP server on {}: {}", tunnel.local, err)
-                                })
-                                .map_err(anyhow::Error::new)
-                                .map_ok(move |stream| {
-                                    // In TProxy mode local destination is the final ip:port destination
-                                    let (host, port) = to_host_port(stream.local_addr().unwrap());
-                                    let remote = RemoteAddr {
-                                        protocol: LocalProtocol::Udp { timeout },
-                                        host,
-                                        port,
-                                    };
-                                    (tokio::io::split(stream), remote)
-                                });
-
+                        use crate::tunnel::listeners::new_tproxy_udp;
+                        let server = new_tproxy_udp(tunnel.local, *timeout).await?;
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(client_config, server).await {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
@@ -1211,65 +1008,41 @@ async fn main() {
                         panic!("Transparent proxy is not available for non Linux platform")
                     }
                     LocalProtocol::Udp { timeout } => {
-                        let (host, port) = tunnel.remote.clone();
-                        let timeout = *timeout;
-                        let server = udp::run_server(tunnel.local, timeout, |_| Ok(()), |s| Ok(s.clone()))
-                            .await
-                            .unwrap_or_else(|err| panic!("Cannot start UDP server on {}: {}", tunnel.local, err))
-                            .map_err(anyhow::Error::new)
-                            .map_ok(move |stream| {
-                                let remote = RemoteAddr {
-                                    protocol: LocalProtocol::Udp { timeout },
-                                    host: host.clone(),
-                                    port,
-                                };
-                                (tokio::io::split(stream), remote)
-                            });
+                        let server = UdpTunnelListener::new(tunnel.local, tunnel.remote.clone(), *timeout).await?;
 
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(client_config, server).await {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
                     LocalProtocol::Socks5 { timeout, credentials } => {
-                        let server = socks5::run_server(tunnel.local, *timeout, credentials.clone())
-                            .await
-                            .unwrap_or_else(|err| panic!("Cannot start Socks5 server on {}: {}", tunnel.local, err))
-                            .map_ok(|(stream, (host, port))| {
-                                let remote = RemoteAddr {
-                                    protocol: stream.local_protocol(),
-                                    host,
-                                    port,
-                                };
-                                (tokio::io::split(stream), remote)
-                            });
-
+                        let server = Socks5TunnelListener::new(tunnel.local, *timeout, credentials.clone()).await?;
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(client_config, server).await {
+                            if let Err(err) = client.run_tunnel(server).await {
+                                error!("{:?}", err);
+                            }
+                        });
+                    }
+                    LocalProtocol::HttpProxy {
+                        timeout,
+                        credentials,
+                        proxy_protocol,
+                    } => {
+                        let server =
+                            HttpProxyTunnelListener::new(tunnel.local, *timeout, credentials.clone(), *proxy_protocol)
+                                .await?;
+                        tokio::spawn(async move {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
                     }
 
-                    LocalProtocol::Stdio => {
-                        let (server, mut handle) = stdio::server::run_server().await.unwrap_or_else(|err| {
-                            panic!("Cannot start STDIO server: {}", err);
-                        });
+                    LocalProtocol::Stdio { proxy_protocol } => {
+                        let (server, mut handle) = new_stdio_listener(tunnel.remote.clone(), *proxy_protocol).await?;
                         tokio::spawn(async move {
-                            if let Err(err) = tunnel::client::run_tunnel(
-                                client_config,
-                                stream::once(async move {
-                                    let remote = RemoteAddr {
-                                        protocol: LocalProtocol::Tcp { proxy_protocol: false },
-                                        host: tunnel.remote.0,
-                                        port: tunnel.remote.1,
-                                    };
-                                    Ok((server, remote))
-                                }),
-                            )
-                            .await
-                            {
+                            if let Err(err) = client.run_tunnel(server).await {
                                 error!("{:?}", err);
                             }
                         });
@@ -1287,6 +1060,7 @@ async fn main() {
                     LocalProtocol::ReverseUdp { .. } => {}
                     LocalProtocol::ReverseSocks5 { .. } => {}
                     LocalProtocol::ReverseUnix { .. } => {}
+                    LocalProtocol::ReverseHttpProxy { .. } => {}
                 }
             }
         }
@@ -1348,10 +1122,14 @@ async fn main() {
                 restriction_cfg
             };
 
+            let http_proxy = mk_http_proxy(args.http_proxy, args.http_proxy_login, args.http_proxy_password)?;
             let server_config = WsServerConfig {
                 socket_so_mark: args.socket_so_mark,
                 bind: args.remote_addr.socket_addrs(|| Some(8080)).unwrap()[0],
-                websocket_ping_frequency: args.websocket_ping_frequency_sec,
+                websocket_ping_frequency: args
+                    .websocket_ping_frequency_sec
+                    .or(Some(Duration::from_secs(30)))
+                    .filter(|d| d.as_secs() > 0),
                 timeout_connect: Duration::from_secs(10),
                 websocket_mask_frame: args.websocket_mask_frame,
                 tls: tls_config,
@@ -1363,21 +1141,52 @@ async fn main() {
                 )
                 .expect("Cannot create DNS resolver"),
                 restriction_config: args.restrict_config,
+                http_proxy,
             };
+            let server = WsServer::new(server_config);
 
             info!(
                 "Starting wstunnel server v{} with config {:?}",
                 env!("CARGO_PKG_VERSION"),
-                server_config
+                server.config
             );
             debug!("Restriction rules: {:#?}", restrictions);
-            tunnel::server::run_server(Arc::new(server_config), restrictions)
-                .await
-                .unwrap_or_else(|err| {
-                    panic!("Cannot start wstunnel server: {:?}", err);
-                });
+            server.serve(restrictions).await.unwrap_or_else(|err| {
+                panic!("Cannot start wstunnel server: {:?}", err);
+            });
         }
     }
 
     tokio::signal::ctrl_c().await.unwrap();
+    Ok(())
+}
+
+fn mk_http_proxy(
+    http_proxy: Option<String>,
+    proxy_login: Option<String>,
+    proxy_password: Option<String>,
+) -> anyhow::Result<Option<Url>> {
+    let Some(proxy) = http_proxy else {
+        return Ok(None);
+    };
+
+    let mut proxy = if proxy.starts_with("http://") {
+        Url::parse(&proxy).with_context(|| "Invalid http proxy url")?
+    } else {
+        Url::parse(&format!("http://{}", proxy)).with_context(|| "Invalid http proxy url")?
+    };
+
+    if let Some(login) = proxy_login {
+        proxy
+            .set_username(login.as_str())
+            .map_err(|_| anyhow!("Cannot set http proxy login"))?;
+    }
+
+    if let Some(password) = proxy_password {
+        proxy
+            .set_password(Some(password.as_str()))
+            .map_err(|_| anyhow!("Cannot set http proxy password"))?;
+    }
+
+    Ok(Some(proxy))
 }

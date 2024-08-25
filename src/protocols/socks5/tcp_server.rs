@@ -1,5 +1,5 @@
-use crate::socks5_udp::Socks5UdpStream;
-use crate::{socks5_udp, LocalProtocol};
+use super::udp_server::{Socks5UdpStream, Socks5UdpStreamWriter};
+use crate::tunnel::LocalProtocol;
 use anyhow::Context;
 use fast_socks5::server::{Config, DenyAuthentication, SimpleUserPassword, Socks5Server};
 use fast_socks5::util::target_addr::TargetAddr;
@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::select;
 use tracing::{info, warn};
@@ -21,18 +22,38 @@ pub struct Socks5Listener {
     socks_server: Pin<Box<dyn Stream<Item = anyhow::Result<(Socks5Stream, (Host, u16))>> + Send>>,
 }
 
+pub enum Socks5ReadHalf {
+    Tcp(OwnedReadHalf),
+    Udp(Socks5UdpStream),
+}
+
+pub enum Socks5WriteHalf {
+    Tcp(OwnedWriteHalf),
+    Udp(Socks5UdpStreamWriter),
+}
+
 pub enum Socks5Stream {
     Tcp(TcpStream),
-    Udp(Socks5UdpStream),
+    Udp((Socks5UdpStream, Socks5UdpStreamWriter)),
 }
 
 impl Socks5Stream {
     pub fn local_protocol(&self) -> LocalProtocol {
         match self {
-            Self::Tcp(_) => LocalProtocol::Tcp { proxy_protocol: false },
+            Self::Tcp(_) => LocalProtocol::Tcp { proxy_protocol: false }, // TODO: Implement proxy protocol
             Self::Udp(s) => LocalProtocol::Udp {
-                timeout: s.watchdog_deadline.as_ref().map(|x| x.period()),
+                timeout: s.0.watchdog_deadline.as_ref().map(|x| x.period()),
             },
+        }
+    }
+
+    pub fn into_split(self) -> (Socks5ReadHalf, Socks5WriteHalf) {
+        match self {
+            Self::Tcp(s) => {
+                let (r, w) = s.into_split();
+                (Socks5ReadHalf::Tcp(r), Socks5WriteHalf::Tcp(w))
+            }
+            Self::Udp((r, w)) => (Socks5ReadHalf::Udp(r), Socks5WriteHalf::Udp(w)),
         }
     }
 }
@@ -72,7 +93,7 @@ pub async fn run_server(
     cfg.set_execute_command(false);
     cfg.set_udp_support(true);
 
-    let udp_server = socks5_udp::run_server(bind, timeout).await?;
+    let udp_server = super::udp_server::run_server(bind, timeout).await?;
     let server = server.with_config(cfg);
     let stream = stream::unfold((server, Box::pin(udp_server)), move |(server, mut udp_server)| async move {
         let mut acceptor = server.incoming();
@@ -95,7 +116,8 @@ pub async fn run_server(
                     return match udp_conn {
                         Some(Ok(stream)) => {
                             let dest = stream.destination();
-                            Some((Ok((Socks5Stream::Udp(stream), dest)), (server, udp_server)))
+                            let writer = stream.writer();
+                            Some((Ok((Socks5Stream::Udp((stream, writer)), dest)), (server, udp_server)))
                         }
                         Some(Err(err)) => {
                             Some((Err(anyhow::Error::new(err)), (server, udp_server)))
@@ -200,38 +222,38 @@ fn new_reply(error: &ReplyError, sock_addr: SocketAddr) -> Vec<u8> {
 }
 
 impl Unpin for Socks5Stream {}
-impl AsyncRead for Socks5Stream {
+impl AsyncRead for Socks5ReadHalf {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Self::Tcp(s) => unsafe { Pin::new_unchecked(s) }.poll_read(cx, buf),
-            Self::Udp(s) => unsafe { Pin::new_unchecked(s) }.poll_read(cx, buf),
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Udp(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
 
-impl AsyncWrite for Socks5Stream {
+impl AsyncWrite for Socks5WriteHalf {
     fn poll_write(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> Poll<Result<usize, Error>> {
         match self.get_mut() {
-            Self::Tcp(s) => unsafe { Pin::new_unchecked(s) }.poll_write(cx, buf),
-            Self::Udp(s) => unsafe { Pin::new_unchecked(s) }.poll_write(cx, buf),
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Udp(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Error>> {
         match self.get_mut() {
-            Self::Tcp(s) => unsafe { Pin::new_unchecked(s) }.poll_flush(cx),
-            Self::Udp(s) => unsafe { Pin::new_unchecked(s) }.poll_flush(cx),
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Self::Udp(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<(), Error>> {
         match self.get_mut() {
-            Self::Tcp(s) => unsafe { Pin::new_unchecked(s) }.poll_shutdown(cx),
-            Self::Udp(s) => unsafe { Pin::new_unchecked(s) }.poll_shutdown(cx),
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Udp(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 
@@ -241,8 +263,8 @@ impl AsyncWrite for Socks5Stream {
         bufs: &[IoSlice<'_>],
     ) -> Poll<Result<usize, Error>> {
         match self.get_mut() {
-            Self::Tcp(s) => unsafe { Pin::new_unchecked(s) }.poll_write_vectored(cx, bufs),
-            Self::Udp(s) => unsafe { Pin::new_unchecked(s) }.poll_write_vectored(cx, bufs),
+            Self::Tcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Udp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
         }
     }
 
@@ -253,22 +275,3 @@ impl AsyncWrite for Socks5Stream {
         }
     }
 }
-
-//#[cfg(test)]
-//mod test {
-//    use super::*;
-//    use futures_util::StreamExt;
-//    use std::str::FromStr;
-//
-//    #[tokio::test]
-//    async fn socks5_server() {
-//        let mut x = run_server(SocketAddr::from_str("[::]:4343").unwrap())
-//            .await
-//            .unwrap();
-//
-//        loop {
-//            let cnx = x.next().await.unwrap().unwrap();
-//            eprintln!("{:?}", cnx);
-//        }
-//    }
-//}

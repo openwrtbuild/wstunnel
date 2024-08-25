@@ -1,4 +1,4 @@
-use crate::LocalProtocol;
+use crate::tunnel::LocalProtocol;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use regex::Regex;
 use serde::{Deserialize, Deserializer};
@@ -78,6 +78,7 @@ pub enum ReverseTunnelConfigProtocol {
     Udp,
     Socks5,
     Unix,
+    HttpProxy,
     Unknown,
 }
 
@@ -156,15 +157,17 @@ impl From<&LocalProtocol> for ReverseTunnelConfigProtocol {
         match value {
             LocalProtocol::Tcp { .. }
             | LocalProtocol::Udp { .. }
-            | LocalProtocol::Stdio
+            | LocalProtocol::Stdio { .. }
             | LocalProtocol::Socks5 { .. }
             | LocalProtocol::TProxyTcp { .. }
             | LocalProtocol::TProxyUdp { .. }
+            | LocalProtocol::HttpProxy { .. }
             | LocalProtocol::Unix { .. } => Self::Unknown,
             LocalProtocol::ReverseTcp => Self::Tcp,
             LocalProtocol::ReverseUdp { .. } => Self::Udp,
             LocalProtocol::ReverseSocks5 { .. } => Self::Socks5,
             LocalProtocol::ReverseUnix { .. } => Self::Unix,
+            LocalProtocol::ReverseHttpProxy { .. } => Self::HttpProxy,
         }
     }
 }
@@ -175,10 +178,12 @@ impl From<&LocalProtocol> for TunnelConfigProtocol {
             | LocalProtocol::ReverseUdp { .. }
             | LocalProtocol::ReverseSocks5 { .. }
             | LocalProtocol::ReverseUnix { .. }
-            | LocalProtocol::Stdio
+            | LocalProtocol::Stdio { .. }
             | LocalProtocol::Socks5 { .. }
             | LocalProtocol::TProxyTcp { .. }
             | LocalProtocol::TProxyUdp { .. }
+            | LocalProtocol::HttpProxy { .. }
+            | LocalProtocol::ReverseHttpProxy { .. }
             | LocalProtocol::Unix { .. } => Self::Unknown,
             LocalProtocol::Tcp { .. } => Self::Tcp,
             LocalProtocol::Udp { .. } => Self::Udp,

@@ -1,13 +1,98 @@
-use crate::tunnel::transport::{TunnelRead, TunnelWrite};
-use bytes::BufMut;
+use crate::tunnel::transport::http2::{Http2TunnelRead, Http2TunnelWrite};
+use crate::tunnel::transport::websocket::{WebsocketTunnelRead, WebsocketTunnelWrite};
+use bytes::{BufMut, BytesMut};
 use futures_util::{pin_mut, FutureExt};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::select;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::time::Instant;
 use tracing::log::debug;
 use tracing::{error, info, warn};
+
+pub(super) static MAX_PACKET_LENGTH: usize = 64 * 1024;
+
+pub trait TunnelWrite: Send + 'static {
+    fn buf_mut(&mut self) -> &mut BytesMut;
+    fn write(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+    fn ping(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+    fn close(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+    fn pending_operations_notify(&mut self) -> Arc<Notify>;
+    fn handle_pending_operations(&mut self) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+}
+
+pub trait TunnelRead: Send + 'static {
+    fn copy(
+        &mut self,
+        writer: impl AsyncWrite + Unpin + Send,
+    ) -> impl Future<Output = Result<(), std::io::Error>> + Send;
+}
+
+pub enum TunnelReader {
+    Websocket(WebsocketTunnelRead),
+    Http2(Http2TunnelRead),
+}
+
+impl TunnelRead for TunnelReader {
+    async fn copy(&mut self, writer: impl AsyncWrite + Unpin + Send) -> Result<(), std::io::Error> {
+        match self {
+            Self::Websocket(s) => s.copy(writer).await,
+            Self::Http2(s) => s.copy(writer).await,
+        }
+    }
+}
+
+pub enum TunnelWriter {
+    Websocket(WebsocketTunnelWrite),
+    Http2(Http2TunnelWrite),
+}
+
+impl TunnelWrite for TunnelWriter {
+    fn buf_mut(&mut self) -> &mut BytesMut {
+        match self {
+            Self::Websocket(s) => s.buf_mut(),
+            Self::Http2(s) => s.buf_mut(),
+        }
+    }
+
+    async fn write(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Websocket(s) => s.write().await,
+            Self::Http2(s) => s.write().await,
+        }
+    }
+
+    async fn ping(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Websocket(s) => s.ping().await,
+            Self::Http2(s) => s.ping().await,
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Websocket(s) => s.close().await,
+            Self::Http2(s) => s.close().await,
+        }
+    }
+
+    fn pending_operations_notify(&mut self) -> Arc<Notify> {
+        match self {
+            Self::Websocket(s) => s.pending_operations_notify(),
+            Self::Http2(s) => s.pending_operations_notify(),
+        }
+    }
+
+    async fn handle_pending_operations(&mut self) -> Result<(), std::io::Error> {
+        match self {
+            Self::Websocket(s) => s.handle_pending_operations().await,
+            Self::Http2(s) => s.handle_pending_operations().await,
+        }
+    }
+}
 
 pub async fn propagate_local_to_remote(
     local_rx: impl AsyncRead,
@@ -27,6 +112,9 @@ pub async fn propagate_local_to_remote(
     let start_at = Instant::now().checked_add(frequency).unwrap_or_else(Instant::now);
     let timeout = tokio::time::interval_at(start_at, frequency);
     let should_close = close_tx.closed().fuse();
+    let notify = ws_tx.pending_operations_notify();
+    let mut has_pending_operations = notify.notified();
+    let mut has_pending_operations_pin = unsafe { Pin::new_unchecked(&mut has_pending_operations) };
 
     pin_mut!(timeout);
     pin_mut!(should_close);
@@ -43,6 +131,18 @@ pub async fn propagate_local_to_remote(
             read_len = local_rx.read_buf(ws_tx.buf_mut()) => read_len,
 
             _ = &mut should_close => break,
+
+            _ = &mut has_pending_operations_pin => {
+                has_pending_operations = notify.notified();
+                has_pending_operations_pin = unsafe { Pin::new_unchecked(&mut has_pending_operations) };
+                match ws_tx.handle_pending_operations().await {
+                    Ok(_) => continue,
+                    Err(err) => {
+                        warn!("error while handling pending operations {}", err);
+                        break;
+                    }
+                }
+            },
 
             _ = timeout.tick(), if ping_frequency.is_some() => {
                 debug!("sending ping to keep connection alive");
