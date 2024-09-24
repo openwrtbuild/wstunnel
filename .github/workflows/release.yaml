@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  RUST_VERSION: 1.78.0
+  RUST_VERSION: 1.80.1
   BIN_NAME: "wstunnel"
 
 jobs:
@@ -161,7 +161,7 @@ jobs:
           fetch-depth: 0
 
       # Download all artifacts
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4.1.7
         with:
           path: artifacts
 
