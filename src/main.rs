@@ -784,7 +784,7 @@ async fn main() -> anyhow::Result<()> {
                     None | Some(80) | Some(443) => args.remote_addr.host().unwrap().to_string(),
                     Some(port) => format!("{}:{}", args.remote_addr.host().unwrap(), port),
                 };
-                HeaderValue::from_str(&host).unwrap()
+                HeaderValue::from_str(&host)?
             };
             if let Some(path) = &args.http_headers_file {
                 if !path.exists() {
@@ -825,6 +825,7 @@ async fn main() -> anyhow::Result<()> {
 
             let client =
                 WsClient::new(client_config, args.connection_min_idle, args.connection_retry_max_backoff_sec).await?;
+            info!("Starting wstunnel client v{}", env!("CARGO_PKG_VERSION"),);
 
             // Start tunnels
             for tunnel in args.remote_to_local.into_iter() {
