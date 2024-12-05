@@ -365,6 +365,7 @@ docker pull ghcr.io/erebe/wstunnel:latest
 * [Proxy SSH](#ssh)
 * [Bypass a corporate proxy](#corporate)
 * [Proxy Wireguard traffic](#wireguard)
+* [Android](#android)
 * [Proxy easily any traffic with transparent proxy (linux only)](#tproxy)
 * [Reverse tunneling](#reverse)
 * [How to secure access of your wstunnel server](#secure)
@@ -462,6 +463,10 @@ ssh -p 9999 login@127.0.0.1
 
 ### Wireguard and wstunnel <a name="wireguard"></a>
 
+You can find a full [tutorial](https://community.hetzner.com/tutorials/obfuscating-wireguard-using-wstunnel) that explain how to setup wstunnel and wireguard at [here](https://community.hetzner.com/tutorials/obfuscating-wireguard-using-wstunnel)
+
+For a quick explanation see below.
+
 You have a working wireguard client configuration called `wg0.conf`. Let's say
 
 ```
@@ -535,6 +540,15 @@ FAQ
   https://github.com/erebe/wstunnel/issues/252
 
 ---
+
+### Android <a name="android"></a>
+
+You can use the android binary and use termux to run it on your phone.
+
+If you want a guide regarding how to use wstunnel on Android, you can follow this [guide](https://community.hetzner.com/tutorials/obfuscating-wireguard-using-wstunnel)
+
+---
+
 
 ### Transparent proxy (linux only) <a name="tproxy"></a>
 
