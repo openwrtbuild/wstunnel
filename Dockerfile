@@ -2,9 +2,9 @@ ARG BUILDER_IMAGE=builder_cache
 
 ############################################################
 # Cache image with all the deps
-FROM rust:1.80-bookworm AS builder_cache
+FROM rust:1.86-bookworm AS builder_cache
 
-RUN rustup component add rustfmt clippy
+RUN rustup component add rustfmt clippy && apt-get update && apt-get install cmake libclang-dev -y
 
 WORKDIR /build
 COPY . ./
@@ -32,12 +32,12 @@ ARG BIN_TARGET=--bins
 ARG PROFILE=release
 
 #ENV RUSTFLAGS="-C link-arg=-Wl,--compress-debug-sections=zlib -C force-frame-pointers=yes"
-RUN cargo build --profile=${PROFILE} ${BIN_TARGET}
+RUN cargo build --features=jemalloc --profile=${PROFILE} ${BIN_TARGET}
 
 
 ############################################################
 # Final image
-FROM debian:bookworm-slim as final-image
+FROM debian:bookworm-slim AS final-image
 
 RUN useradd -ms /bin/bash app && \
         apt-get update && \

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/erebe/wstunnel/raw/main/docs/logo_wstunnel.png" alt="wstunnel logo"/>
+  <img src="https://github.com/erebe/wstunnel/raw/main/docs/logo_wstunnel.png" alt="wstunnel logo" height="400"/>
 </p>
 
 <p align="right">
@@ -675,6 +675,6 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 and run those commands at the root of the project
 
 ```
-cargo build
+cargo build --package wstunnel-cli
 target/debug/wstunnel ...
 ```
